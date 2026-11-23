@@ -1,0 +1,73 @@
+--select@preset:縦横比=0,4:3 (DSi/3DS標準)=0,5:3 (3DS上画面)=1,1:1 (正方形)=2,16:9 (ワイド)=3,9:16 (縦長)=4,カスタム=5
+--track@custom_w:カスタム横比,1,100,4,0.1
+--track@custom_h:カスタム縦比,1,100,3,0.1
+--track@offset:切り抜き位置(%),-100,100,0,0.5
+
+--[[pixelshader@aspect_crop:
+Texture2D tex0 : register(t0);
+SamplerState smp0 : register(s0);
+
+cbuffer constant0 : register(b0) {
+    float offX;
+    float offY;
+    float srcW;
+    float srcH;
+};
+
+float4 aspect_crop(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float2 srcUv = (pos.xy + float2(offX, offY)) / float2(srcW, srcH);
+    return tex0.Sample(smp0, srcUv);
+}
+]]
+
+local orig_w, orig_h = obj.getpixel()
+if orig_w <= 0 or orig_h <= 0 then
+    return
+end
+
+local rw, rh
+if preset == 0 then
+    rw, rh = 4, 3
+elseif preset == 1 then
+    rw, rh = 5, 3
+elseif preset == 2 then
+    rw, rh = 1, 1
+elseif preset == 3 then
+    rw, rh = 16, 9
+elseif preset == 4 then
+    rw, rh = 9, 16
+else
+    rw = math.max(0.01, custom_w)
+    rh = math.max(0.01, custom_h)
+end
+
+local target_ar = rw / rh
+local src_ar = orig_w / orig_h
+
+local cw, ch
+if src_ar > target_ar then
+    ch = orig_h
+    cw = math.max(2, math.min(orig_w, math.floor(orig_h * target_ar + 0.5)))
+else
+    cw = orig_w
+    ch = math.max(2, math.min(orig_h, math.floor(orig_w / target_ar + 0.5)))
+end
+
+if cw == orig_w and ch == orig_h then
+    return
+end
+
+local t = (offset + 100.0) / 200.0
+local off_x = math.floor((orig_w - cw) * t + 0.5)
+local off_y = math.floor((orig_h - ch) * t + 0.5)
+
+obj.copybuffer("tempbuffer", "object")
+obj.clearbuffer("object", cw, ch)
+obj.pixelshader(
+    "aspect_crop",
+    "object",
+    { "tempbuffer" },
+    { off_x, off_y, orig_w, orig_h },
+    "copy",
+    "dot"
+)
