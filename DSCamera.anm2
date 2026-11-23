@@ -1,0 +1,798 @@
+--select@preset:プリセット=0,手動(スライダー値)=0,3DSムービー(標準240p)=1,DSi/3DS写真(標準480p)=2,夕暮れ・青被り=3,薄暗・田園暗所=4,室内・蛍光灯=5,曇天・看板文字=6
+--track@ae_exp:露出補正,-100,100,0,0.5
+--track@target_h:仮想縦解像度,120,720,300,1
+--track@noise_fps:ノイズ更新FPS,0,60,15,0.5
+--select@awb_mode:色転び傾向=0,標準(DSバランス)=0,夕暮れ青被り=1,薄暗グリーン=2,室内蛍光灯=3
+--track@awb_str:色転び強度,0,100,45,0.5
+--check@pixel_upscale:ドット感を残す拡大,0
+
+--group:光学・レンズ劣化,true
+--track@softness:レンズ甘さ,0,100,45,0.5
+--track@halation:ハレーション,0,100,45,0.5
+--track@veil_flare:ベールフレア,0,100,30,0.5
+--track@ca_amt:倍率色収差,0,100,35,0.5
+--track@pf_amt:パープルフリンジ,0,100,40,0.5
+--track@vignette:周辺減光,0,100,25,0.5
+
+--group:露出・センサー・ノイズ,true
+--track@ae_str:疑似AE強度,0,100,45,0.5
+--track@clip_gain:白飛び強調,0,100,30,0.5
+--track@black_lift:暗部黒浮き,0,100,30,0.5
+--track@sharpness:ISP輪郭強調,0,100,25,0.5
+--track@noise_amt:暗所ノイズ量,0,100,55,0.5
+--track@chroma_noise:カラーノイズ比,0,100,72,0.5
+--track@lowfreq_noise:低周波カラームラ,0,100,45,0.5
+--track@fpn_amt:固定ノイズ(FPN),0,100,20,0.5
+
+--group:圧縮・階調劣化,true
+--track@bit_crush:階調潰れ,0,100,30,0.5
+--track@jpeg_q:JPEG品質,1,100,32,1
+--track@jpeg_mix:JPEG劣化強度,0,100,100,1
+
+--[[pixelshader@ds_optics_base:
+Texture2D tex0 : register(t0);
+SamplerState smp0 : register(s0);
+
+cbuffer constant0 : register(b0) {
+    float dstW;
+    float dstH;
+    float softness;
+    float caAmt;
+    float pfAmt;
+    float vignette;
+};
+
+float3 toStraight(float4 c) {
+    return (c.a > 1e-5) ? (c.rgb / c.a) : float3(0.0, 0.0, 0.0);
+}
+
+float3 sampleCA(float2 uv, float2 caOff, out float alphaOut) {
+    float4 cG = tex0.Sample(smp0, uv);
+    alphaOut = cG.a;
+    if (dot(caOff, caOff) < 1e-10) {
+        return toStraight(cG);
+    }
+    float4 cR = tex0.Sample(smp0, uv + caOff);
+    float4 cB = tex0.Sample(smp0, uv - caOff);
+    float3 r3 = toStraight(cR);
+    float3 g3 = toStraight(cG);
+    float3 b3 = toStraight(cB);
+    return float3(r3.r, g3.g, b3.b);
+}
+
+float4 ds_optics_base(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float2 texel = 1.0 / float2(dstW, dstH);
+    float2 d = uv - float2(0.5, 0.5);
+    float r2 = dot(d, d);
+    float edgeFactor = saturate(r2 * 2.0);
+
+    // 1. 倍率色収差（画面端ほど強くなる赤・青のズレ）
+    float2 caOff = d * (caAmt * 0.012 * (0.35 + 1.65 * edgeFactor));
+
+    float aCenter;
+    float3 centerRgb = sampleCA(uv, caOff, aCenter);
+    float3 col = centerRgb;
+
+    // 2. 周辺ほど甘くなる 9点ガウスソフトフォーカス
+    float localSoft = softness * (0.60 + 1.30 * edgeFactor);
+    if (localSoft > 0.001) {
+        float blurR = localSoft * 1.15;
+        float dummyA;
+        float3 s = centerRgb * 0.25;
+        s += sampleCA(uv + float2( blurR,  0.0) * texel, caOff, dummyA) * 0.125;
+        s += sampleCA(uv + float2(-blurR,  0.0) * texel, caOff, dummyA) * 0.125;
+        s += sampleCA(uv + float2( 0.0,  blurR) * texel, caOff, dummyA) * 0.125;
+        s += sampleCA(uv + float2( 0.0, -blurR) * texel, caOff, dummyA) * 0.125;
+        s += sampleCA(uv + float2( blurR,  blurR) * texel, caOff, dummyA) * 0.0625;
+        s += sampleCA(uv + float2(-blurR,  blurR) * texel, caOff, dummyA) * 0.0625;
+        s += sampleCA(uv + float2( blurR, -blurR) * texel, caOff, dummyA) * 0.0625;
+        s += sampleCA(uv + float2(-blurR, -blurR) * texel, caOff, dummyA) * 0.0625;
+        col = lerp(centerRgb, s, saturate(localSoft));
+    }
+
+    // 3. パープルフリンジ（高輝度と暗部の境界に滲む紫・マゼンタ）
+    if (pfAmt > 0.001) {
+        float3 n1 = toStraight(tex0.Sample(smp0, uv + float2( 1.5,  0.0) * texel));
+        float3 n2 = toStraight(tex0.Sample(smp0, uv + float2(-1.5,  0.0) * texel));
+        float3 n3 = toStraight(tex0.Sample(smp0, uv + float2( 0.0,  1.5) * texel));
+        float3 n4 = toStraight(tex0.Sample(smp0, uv + float2( 0.0, -1.5) * texel));
+        float l1 = dot(n1, float3(0.299, 0.587, 0.114));
+        float l2 = dot(n2, float3(0.299, 0.587, 0.114));
+        float l3 = dot(n3, float3(0.299, 0.587, 0.114));
+        float l4 = dot(n4, float3(0.299, 0.587, 0.114));
+        float maxL = max(max(l1, l2), max(l3, l4));
+        float curL = dot(col, float3(0.299, 0.587, 0.114));
+
+        float contrast = max(0.0, maxL - curL);
+        float hiGate = smoothstep(0.68, 0.96, maxL);
+        float darkGate = 1.0 - smoothstep(0.42, 0.85, curL);
+        float pf = contrast * hiGate * darkGate * (0.25 + 0.75 * edgeFactor) * pfAmt * 1.15;
+        col = saturate(col + float3(0.72, 0.05, 0.95) * pf);
+    }
+
+    // 4. 周辺減光（ヴィネット）
+    if (vignette > 0.001) {
+        float vig = 1.0 - vignette * 0.45 * saturate(r2 * 1.9);
+        col *= vig;
+    }
+
+    return float4(saturate(col) * aCenter, aCenter);
+}
+]]
+
+--[[pixelshader@ds_ae_measure:
+Texture2D tex0 : register(t0);
+SamplerState smp0 : register(s0);
+
+float3 toStraight(float4 c) {
+    return (c.a > 1e-5) ? (c.rgb / c.a) : float3(0.0, 0.0, 0.0);
+}
+
+// 4x4 出力バッファの各セル内で 4x4 = 16点（全体256点）を測光
+float4 ds_ae_measure(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float2 cellIdx = floor(pos.xy);
+    float2 cellMin = cellIdx * 0.25;
+    float sumLuma = 0.0;
+    float sumHi = 0.0;
+    float sumCenterLuma = 0.0;
+    float sumCenterW = 0.0;
+
+    [unroll]
+    for (int sy = 0; sy < 4; sy++) {
+        [unroll]
+        for (int sx = 0; sx < 4; sx++) {
+            float2 suv = cellMin + (float2((float)sx, (float)sy) + 0.5) * 0.0625;
+            float3 rgb = toStraight(tex0.Sample(smp0, suv));
+            float luma = dot(rgb, float3(0.299, 0.587, 0.114));
+            sumLuma += luma;
+            sumHi += smoothstep(0.72, 0.96, luma);
+
+            float2 d = suv - float2(0.5, 0.5);
+            float w = exp(-dot(d, d) * 3.5);
+            sumCenterLuma += luma * w;
+            sumCenterW += w;
+        }
+    }
+
+    return float4(
+        sumLuma * 0.0625,
+        sumHi * 0.0625,
+        sumCenterLuma / max(1e-5, sumCenterW),
+        1.0
+    );
+}
+]]
+
+--[[pixelshader@ds_bright_extract:
+Texture2D tex0 : register(t0);
+SamplerState smp0 : register(s0);
+
+cbuffer constant0 : register(b0) {
+    float srcW;
+    float srcH;
+};
+
+float3 toStraight(float4 c) {
+    return (c.a > 1e-5) ? (c.rgb / c.a) : float3(0.0, 0.0, 0.0);
+}
+
+// 2x2 周辺サンプルで細い点光源を取りこぼさず高輝度部を抽出
+float4 ds_bright_extract(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float2 htex = 0.5 / float2(srcW, srcH);
+    float3 s0 = toStraight(tex0.Sample(smp0, uv + float2(-htex.x, -htex.y)));
+    float3 s1 = toStraight(tex0.Sample(smp0, uv + float2( htex.x, -htex.y)));
+    float3 s2 = toStraight(tex0.Sample(smp0, uv + float2(-htex.x,  htex.y)));
+    float3 s3 = toStraight(tex0.Sample(smp0, uv + float2( htex.x,  htex.y)));
+
+    float3 b0 = s0 * smoothstep(0.65, 0.98, dot(s0, float3(0.299, 0.587, 0.114)));
+    float3 b1 = s1 * smoothstep(0.65, 0.98, dot(s1, float3(0.299, 0.587, 0.114)));
+    float3 b2 = s2 * smoothstep(0.65, 0.98, dot(s2, float3(0.299, 0.587, 0.114)));
+    float3 b3 = s3 * smoothstep(0.65, 0.98, dot(s3, float3(0.299, 0.587, 0.114)));
+
+    float3 avg = (b0 + b1 + b2 + b3) * 0.25;
+    float3 peak = max(max(b0, b1), max(b2, b3));
+    float3 outRgb = lerp(avg, peak, 0.35);
+    return float4(outRgb, 1.0);
+}
+]]
+
+--[[pixelshader@ds_gauss:
+Texture2D tex0 : register(t0);
+SamplerState smp0 : register(s0);
+
+cbuffer constant0 : register(b0) {
+    float stepX;
+    float stepY;
+};
+
+// 13タップ 1D 分離ガウスぼかし（水平・垂直で共用）
+float4 ds_gauss(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    static const float w[7] = {
+        0.155284, 0.144213, 0.115516, 0.079801, 0.047548, 0.024442, 0.010839
+    };
+    float2 stepUv = float2(stepX, stepY);
+    float3 sum = tex0.Sample(smp0, uv).rgb * w[0];
+    [unroll]
+    for (int i = 1; i <= 6; i++) {
+        float2 off = stepUv * (float)i;
+        sum += (tex0.Sample(smp0, uv + off).rgb + tex0.Sample(smp0, uv - off).rgb) * w[i];
+    }
+    return float4(sum, 1.0);
+}
+]]
+
+--[[pixelshader@ds_sensor:
+Texture2D texBase : register(t0);
+Texture2D texAE   : register(t1);
+Texture2D texHalo : register(t2);
+Texture2D texVeil : register(t3);
+SamplerState smp0 : register(s0);
+
+cbuffer constant0 : register(b0) {
+    float w;
+    float h;
+    float halation;
+    float veilFlare;
+    float aeStr;
+    float aeExp;
+    float sharpness;
+    float blackLift;
+    float clipGain;
+    float noiseAmt;
+    float chromaNoise;
+    float lowFreqNoise;
+    float fpnAmt;
+    float bitCrush;
+    float awbMode;
+    float awbStr;
+    float seedFrame;
+};
+
+float3 toStraight(float4 c) {
+    return (c.a > 1e-5) ? (c.rgb / c.a) : float3(0.0, 0.0, 0.0);
+}
+
+uint pcg_hash(uint v) {
+    uint state = v * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float hash31(uint3 p) {
+    uint h = pcg_hash(p.x ^ pcg_hash(p.y ^ pcg_hash(p.z)));
+    return (float)h * (1.0 / 4294967295.0);
+}
+
+// 疑似ガウス分布（-1.0 ～ +1.0）
+float gauss31(uint3 p) {
+    return hash31(p) + hash31(p + uint3(17u, 31u, 53u)) - 1.0;
+}
+
+// 滑らかな 2D バリューノイズ（低周波の暗所カラームラ用）
+float valueNoise2D(float2 p, uint seed) {
+    float2 i = floor(p);
+    float2 f = frac(p);
+    float2 u = f * f * (3.0 - 2.0 * f);
+    uint2 ui = uint2(max(float2(0.0, 0.0), i));
+    float a = hash31(uint3(ui.x,      ui.y,      seed));
+    float b = hash31(uint3(ui.x + 1u, ui.y,      seed));
+    float c = hash31(uint3(ui.x,      ui.y + 1u, seed));
+    float d = hash31(uint3(ui.x + 1u, ui.y + 1u, seed));
+    return lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y) * 2.0 - 1.0;
+}
+
+float4 ds_sensor(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float2 texel = 1.0 / float2(w, h);
+    float4 c0 = texBase.Sample(smp0, uv);
+    float3 baseRgb = toStraight(c0);
+    float3 rgb = baseRgb;
+
+    // 1. 滑らかな 2パスガウスハレーション ＋ 広域ベールフレア合成
+    if (halation > 0.001) {
+        float3 haloRgb = texHalo.Sample(smp0, uv).rgb;
+        rgb += haloRgb * (halation * 0.85);
+    }
+    if (veilFlare > 0.001) {
+        float3 veilCol = texVeil.Sample(smp0, uv).rgb * (veilFlare * 0.65);
+        float veilLuma = dot(veilCol, float3(0.299, 0.587, 0.114));
+        rgb = rgb * (1.0 - saturate(veilLuma * 0.35)) + veilCol;
+    }
+
+    // 2. ISP の安価な輪郭強調
+    if (sharpness > 0.001) {
+        float3 n1 = toStraight(texBase.Sample(smp0, uv + float2( texel.x, 0.0)));
+        float3 n2 = toStraight(texBase.Sample(smp0, uv + float2(-texel.x, 0.0)));
+        float3 n3 = toStraight(texBase.Sample(smp0, uv + float2(0.0,  texel.y)));
+        float3 n4 = toStraight(texBase.Sample(smp0, uv + float2(0.0, -texel.y)));
+        float3 avg = (n1 + n2 + n3 + n4) * 0.25;
+        rgb += (baseRgb - avg) * (sharpness * 1.1);
+    }
+
+    // 3. フレーム輝度連動の疑似AE ＋ 露出補正（EVシフト）
+    float aeGain = 1.0;
+    float isoBoost = 1.0;
+    if (aeStr > 0.001) {
+        float sumL = 0.0;
+        float sumHi = 0.0;
+        float sumC = 0.0;
+        [unroll]
+        for (int ay = 0; ay < 4; ay++) {
+            [unroll]
+            for (int ax = 0; ax < 4; ax++) {
+                float4 m = texAE.Load(int3(ax, ay, 0));
+                sumL += m.r;
+                sumHi += m.g;
+                sumC += m.b;
+            }
+        }
+        float avgL = sumL * 0.0625;
+        float hiRatio = sumHi * 0.0625;
+        float centerL = sumC * 0.0625;
+
+        float meter = lerp(avgL, centerL, 0.45) + hiRatio * 0.45;
+        float rawGain = clamp(0.40 / max(0.08, meter), 0.52, 1.85);
+        aeGain = lerp(1.0, rawGain, aeStr);
+        isoBoost = 1.0 + max(0.0, aeGain - 1.0) * 1.15;
+    }
+    float expMult = pow(2.0, aeExp * 1.2);
+    rgb *= (aeGain * expMult);
+
+    // 4. 狭いダイナミックレンジ（白飛びクリッピング ＋ 暗部黒浮き）
+    float gain = 1.0 + clipGain * 0.45;
+    rgb = saturate((rgb - 0.03 * clipGain) * gain);
+    rgb = saturate(lerp(rgb, smoothstep(0.0, 0.92, rgb), clipGain * 0.5));
+
+    float lift = blackLift * 0.065;
+    float3 liftTint = float3(0.95, 1.05, 0.98);
+    rgb = rgb * (1.0 - lift) + lift * liftTint;
+
+    // 5. オートホワイトバランス（AWB）の色転び
+    float3 wbGain = float3(1.0, 1.0, 1.0);
+    float3 shadowTint = float3(0.0, 0.0, 0.0);
+    int mode = (int)(awbMode + 0.5);
+    if (mode == 0) {
+        wbGain = float3(0.97, 1.01, 1.02);
+        shadowTint = float3(0.005, 0.012, 0.010);
+    } else if (mode == 1) {
+        wbGain = float3(0.68, 0.93, 1.28);
+        shadowTint = float3(-0.01, 0.015, 0.055);
+    } else if (mode == 2) {
+        wbGain = float3(0.92, 1.04, 0.98);
+        shadowTint = float3(0.010, 0.028, 0.015);
+    } else {
+        wbGain = float3(0.94, 1.03, 1.06);
+        shadowTint = float3(0.012, 0.018, 0.008);
+    }
+    float lumaPre = dot(rgb, float3(0.299, 0.587, 0.114));
+    rgb = saturate(lerp(rgb, rgb * wbGain + shadowTint * (1.0 - lumaPre), awbStr));
+
+    // 6. 3層暗所CMOSノイズ（高周波 ＋ 2x2カラー斑点 ＋ 低周波暗所カラームラ ＋ FPN）
+    uint2 px = uint2(pos.xy);
+    uint tSeed = (uint)max(0.0, seedFrame) + 1u;
+
+    float darkWeight = pow(saturate(1.0 - lumaPre), 1.65) * 0.85 + 0.15;
+    float lumaN = gauss31(uint3(px.x, px.y, tSeed * 3u));
+
+    uint2 cpx = px / 2u;
+    float cnR = gauss31(uint3(cpx.x, cpx.y, tSeed * 7u + 11u));
+    float cnG = gauss31(uint3(cpx.x, cpx.y, tSeed * 7u + 29u));
+    float cnB = gauss31(uint3(cpx.x, cpx.y, tSeed * 7u + 47u));
+    float fineR = gauss31(uint3(px.x, px.y, tSeed * 5u + 3u));
+    float fineG = gauss31(uint3(px.x, px.y, tSeed * 5u + 13u));
+    float fineB = gauss31(uint3(px.x, px.y, tSeed * 5u + 23u));
+
+    float3 chromaVec = lerp(float3(fineR, fineG, fineB), float3(cnR, cnG, cnB), 0.65);
+    chromaVec *= float3(1.05, 1.15, 1.10);
+
+    float3 dynNoise = lerp(float3(lumaN, lumaN, lumaN), chromaVec, chromaNoise);
+    rgb += dynNoise * (noiseAmt * 0.13 * darkWeight * isoBoost);
+
+    if (lowFreqNoise > 0.001) {
+        float deepDark = pow(saturate(1.0 - lumaPre), 2.1);
+        float2 pMed = pos.xy * 0.20;
+        float2 pBig = pos.xy * 0.105;
+
+        float mG  = valueNoise2D(pMed, tSeed * 11u + 5u);
+        float mRb = valueNoise2D(pMed, tSeed * 11u + 37u);
+        float bG  = valueNoise2D(pBig, tSeed * 13u + 71u);
+        float bRb = valueNoise2D(pBig, tSeed * 13u + 109u);
+
+        float gm = mG * 0.65 + bG * 0.35;
+        float rb = mRb * 0.65 + bRb * 0.35;
+        float3 blotch = float3(
+            -gm * 0.55 + rb * 0.50,
+             gm * 0.85,
+            -gm * 0.45 - rb * 0.65
+        );
+        rgb += blotch * (lowFreqNoise * 0.11 * deepDark * isoBoost);
+    }
+
+    if (fpnAmt > 0.001) {
+        float colStreak = (hash31(uint3(px.x, 0u, 991u)) - 0.5);
+        float pxFixed   = (hash31(uint3(px.x, px.y, 1337u)) - 0.5);
+        float fpn = (colStreak * 0.65 + pxFixed * 0.35) * (fpnAmt * 0.055 * darkWeight * isoBoost);
+        rgb += float3(fpn * 0.9, fpn * 1.1, fpn);
+    }
+
+    float lumaPost = dot(rgb, float3(0.299, 0.587, 0.114));
+    rgb = saturate(lerp(float3(lumaPost, lumaPost, lumaPost), rgb, 0.90));
+
+    // 7. 簡易低ビット深度化（階調潰れ・バンディング）
+    if (bitCrush > 0.001) {
+        float levels = lerp(64.0, 22.0, bitCrush);
+        float3 crushed = floor(rgb * levels + 0.5) / levels;
+        rgb = lerp(rgb, crushed, bitCrush * 0.85);
+    }
+
+    return float4(saturate(rgb) * c0.a, c0.a);
+}
+]]
+
+--[[computeshader@ds_jpeg:
+Texture2D<float4> texIn : register(t0);
+RWTexture2D<float4> texOut : register(u0);
+
+cbuffer constant0 : register(b0) {
+    float imgW;
+    float imgH;
+    float jpegQuality;
+    float jpegMix;
+};
+
+static const float PI_16 = 0.19634954084936207;
+static const float INV_SQRT8 = 0.35355339059327376;
+
+static const float Q_Y[64] = {
+    16, 11, 10, 16, 24, 40, 51, 61,
+    12, 12, 14, 19, 26, 58, 60, 55,
+    14, 13, 16, 24, 40, 57, 69, 56,
+    14, 17, 22, 29, 51, 87, 80, 62,
+    18, 22, 37, 56, 68,109,103, 77,
+    24, 35, 55, 64, 81,104,113, 92,
+    49, 64, 78, 87,103,121,120,101,
+    72, 92, 95, 98,112,100,103, 99
+};
+
+static const float Q_C[64] = {
+    17, 18, 24, 47, 99, 99, 99, 99,
+    18, 21, 26, 66, 99, 99, 99, 99,
+    24, 26, 56, 99, 99, 99, 99, 99,
+    47, 66, 99, 99, 99, 99, 99, 99,
+    99, 99, 99, 99, 99, 99, 99, 99,
+    99, 99, 99, 99, 99, 99, 99, 99,
+    99, 99, 99, 99, 99, 99, 99, 99,
+    99, 99, 99, 99, 99, 99, 99, 99
+};
+
+groupshared float3 g_blk[8][8];
+groupshared float3 g_tmp[8][8];
+groupshared float g_alpha[8][8];
+
+[numthreads(8, 8, 1)]
+void ds_jpeg(uint3 Gid : SV_GroupID, uint3 GTid : SV_GroupThreadID, uint3 DTid : SV_DispatchThreadID) {
+    uint w = (uint)imgW;
+    uint h = (uint)imgH;
+    uint tx = GTid.x;
+    uint ty = GTid.y;
+
+    uint2 p = min(DTid.xy, uint2(max(1u, w) - 1u, max(1u, h) - 1u));
+    float4 raw = texIn.Load(int3(p, 0));
+    float a = raw.a;
+    float3 rgb = (a > 1e-5) ? (raw.rgb / a) : float3(0.0, 0.0, 0.0);
+
+    float Y  = ( 0.299    * rgb.r + 0.587    * rgb.g + 0.114    * rgb.b) * 255.0 - 128.0;
+    float Cb = (-0.168736 * rgb.r - 0.331264 * rgb.g + 0.5      * rgb.b) * 255.0;
+    float Cr = ( 0.5      * rgb.r - 0.418688 * rgb.g - 0.081312 * rgb.b) * 255.0;
+
+    g_blk[ty][tx] = float3(Y, Cb, Cr);
+    g_alpha[ty][tx] = a;
+    GroupMemoryBarrierWithGroupSync();
+
+    // YCbCr 4:2:0 クロマサブサンプリング
+    uint bx = tx & 6u;
+    uint by = ty & 6u;
+    float2 cAvg = (
+        g_blk[by    ][bx    ].yz +
+        g_blk[by    ][bx + 1].yz +
+        g_blk[by + 1][bx    ].yz +
+        g_blk[by + 1][bx + 1].yz
+    ) * 0.25;
+    GroupMemoryBarrierWithGroupSync();
+    g_blk[ty][tx].yz = lerp(g_blk[ty][tx].yz, cAvg, jpegMix);
+    GroupMemoryBarrierWithGroupSync();
+
+    // 水平 1D-DCT
+    float akX = (tx == 0u) ? INV_SQRT8 : 0.5;
+    float3 sumH = float3(0.0, 0.0, 0.0);
+    [unroll]
+    for (uint n = 0u; n < 8u; n++) {
+        sumH += g_blk[ty][n] * cos((2.0 * (float)n + 1.0) * (float)tx * PI_16);
+    }
+    g_tmp[ty][tx] = sumH * akX;
+    GroupMemoryBarrierWithGroupSync();
+
+    // 垂直 1D-DCT
+    float akY = (ty == 0u) ? INV_SQRT8 : 0.5;
+    float3 sumV = float3(0.0, 0.0, 0.0);
+    [unroll]
+    for (uint n2 = 0u; n2 < 8u; n2++) {
+        sumV += g_tmp[n2][tx] * cos((2.0 * (float)n2 + 1.0) * (float)ty * PI_16);
+    }
+    float3 coeff = sumV * akY;
+
+    // IJG標準スケール量子化
+    uint qIdx = ty * 8u + tx;
+    float qClamped = clamp(jpegQuality, 1.0, 100.0);
+    float qScale = (qClamped < 50.0) ? (5000.0 / qClamped) : (200.0 - 2.0 * qClamped);
+    float qY = max(1.0, floor((Q_Y[qIdx] * qScale + 50.0) / 100.0));
+    float qC = max(1.0, floor((Q_C[qIdx] * qScale + 50.0) / 100.0));
+    float3 qStep = float3(qY, qC, qC);
+
+    float3 quant = round(coeff / qStep) * qStep;
+    g_blk[ty][tx] = lerp(coeff, quant, jpegMix);
+    GroupMemoryBarrierWithGroupSync();
+
+    // 垂直 1D-IDCT
+    float3 isumV = float3(0.0, 0.0, 0.0);
+    [unroll]
+    for (uint k = 0u; k < 8u; k++) {
+        float ak = (k == 0u) ? INV_SQRT8 : 0.5;
+        isumV += g_blk[k][tx] * (ak * cos((2.0 * (float)ty + 1.0) * (float)k * PI_16));
+    }
+    g_tmp[ty][tx] = isumV;
+    GroupMemoryBarrierWithGroupSync();
+
+    // 水平 1D-IDCT
+    float3 isumH = float3(0.0, 0.0, 0.0);
+    [unroll]
+    for (uint k2 = 0u; k2 < 8u; k2++) {
+        float ak = (k2 == 0u) ? INV_SQRT8 : 0.5;
+        isumH += g_tmp[ty][k2] * (ak * cos((2.0 * (float)tx + 1.0) * (float)k2 * PI_16));
+    }
+
+    if (DTid.x < w && DTid.y < h) {
+        float yOut  = (isumH.x + 128.0) / 255.0;
+        float cbOut = isumH.y / 255.0;
+        float crOut = isumH.z / 255.0;
+
+        float3 outRgb;
+        outRgb.r = yOut + 1.402    * crOut;
+        outRgb.g = yOut - 0.344136 * cbOut - 0.714136 * crOut;
+        outRgb.b = yOut + 1.772    * cbOut;
+        outRgb = saturate(outRgb);
+
+        float oa = g_alpha[ty][tx];
+        texOut[DTid.xy] = float4(outRgb * oa, oa);
+    }
+}
+]]
+
+--[[pixelshader@ds_upscale:
+Texture2D tex0 : register(t0);
+SamplerState smp0 : register(s0);
+
+float4 ds_upscale(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    return tex0.Sample(smp0, uv);
+}
+]]
+
+-- ============================================================
+-- プリセット定義テーブル
+-- ============================================================
+local PRESETS = {
+    -- 1: 3DSムービー(標準240p)
+    [1] = {
+        target_h = 240, awb_mode = 0, awb_str = 40,
+        softness = 50, halation = 45, veil_flare = 28, ca_amt = 35, pf_amt = 40, vignette = 25,
+        ae_str = 50, ae_exp = -8, clip_gain = 32, black_lift = 25, sharpness = 22,
+        noise_amt = 55, chroma_noise = 72, lowfreq_noise = 48, fpn_amt = 20,
+        bit_crush = 32, jpeg_q = 26, jpeg_mix = 100
+    },
+    -- 2: DSi/3DS写真(標準480p)
+    [2] = {
+        target_h = 480, awb_mode = 0, awb_str = 35,
+        softness = 35, halation = 38, veil_flare = 22, ca_amt = 30, pf_amt = 35, vignette = 22,
+        ae_str = 35, ae_exp = 0, clip_gain = 28, black_lift = 28, sharpness = 30,
+        noise_amt = 48, chroma_noise = 70, lowfreq_noise = 40, fpn_amt = 18,
+        bit_crush = 25, jpeg_q = 38, jpeg_mix = 100
+    },
+    -- 3: 夕暮れ・青被り
+    [3] = {
+        target_h = 360, awb_mode = 1, awb_str = 72,
+        softness = 42, halation = 68, veil_flare = 32, ca_amt = 35, pf_amt = 48, vignette = 30,
+        ae_str = 45, ae_exp = -18, clip_gain = 35, black_lift = 22, sharpness = 22,
+        noise_amt = 58, chroma_noise = 68, lowfreq_noise = 50, fpn_amt = 22,
+        bit_crush = 35, jpeg_q = 34, jpeg_mix = 100
+    },
+    -- 4: 薄暗・田園暗所
+    [4] = {
+        target_h = 360, awb_mode = 2, awb_str = 52,
+        softness = 45, halation = 30, veil_flare = 20, ca_amt = 28, pf_amt = 32, vignette = 32,
+        ae_str = 40, ae_exp = -20, clip_gain = 22, black_lift = 40, sharpness = 20,
+        noise_amt = 72, chroma_noise = 78, lowfreq_noise = 68, fpn_amt = 28,
+        bit_crush = 36, jpeg_q = 30, jpeg_mix = 100
+    },
+    -- 5: 室内・蛍光灯
+    [5] = {
+        target_h = 360, awb_mode = 3, awb_str = 48,
+        softness = 40, halation = 48, veil_flare = 30, ca_amt = 30, pf_amt = 30, vignette = 25,
+        ae_str = 45, ae_exp = -6, clip_gain = 44, black_lift = 32, sharpness = 28,
+        noise_amt = 68, chroma_noise = 80, lowfreq_noise = 62, fpn_amt = 25,
+        bit_crush = 30, jpeg_q = 34, jpeg_mix = 100
+    },
+    -- 6: 曇天・看板文字
+    [6] = {
+        target_h = 420, awb_mode = 0, awb_str = 32,
+        softness = 50, halation = 42, veil_flare = 28, ca_amt = 38, pf_amt = 42, vignette = 20,
+        ae_str = 40, ae_exp = 0, clip_gain = 30, black_lift = 32, sharpness = 36,
+        noise_amt = 50, chroma_noise = 70, lowfreq_noise = 42, fpn_amt = 18,
+        bit_crush = 28, jpeg_q = 28, jpeg_mix = 100
+    }
+}
+
+-- ============================================================
+-- Lua 制御部（プリセット解決 ＋ 同一フレーム完結マルチパス）
+-- ============================================================
+local orig_w, orig_h = obj.getpixel()
+if orig_w <= 0 or orig_h <= 0 then
+    return
+end
+
+local p = {
+    target_h      = target_h,
+    awb_mode      = awb_mode,
+    awb_str       = awb_str,
+    softness      = softness,
+    halation      = halation,
+    veil_flare    = veil_flare,
+    ca_amt        = ca_amt,
+    pf_amt        = pf_amt,
+    vignette      = vignette,
+    ae_str        = ae_str,
+    ae_exp        = 0,
+    clip_gain     = clip_gain,
+    black_lift    = black_lift,
+    sharpness     = sharpness,
+    noise_amt     = noise_amt,
+    chroma_noise  = chroma_noise,
+    lowfreq_noise = lowfreq_noise,
+    fpn_amt       = fpn_amt,
+    bit_crush     = bit_crush,
+    jpeg_q        = jpeg_q,
+    jpeg_mix      = jpeg_mix
+}
+
+local preset_data = PRESETS[preset]
+if preset_data then
+    for k, v in pairs(preset_data) do
+        p[k] = v
+    end
+end
+
+-- 露出補正はプリセット基準値に対して常にスライダーで微調整可能にする
+local eff_ae_exp = math.max(-100, math.min(100, p.ae_exp + ae_exp))
+
+local dh = math.max(16, math.min(orig_h, math.floor(p.target_h + 0.5)))
+local dw = math.max(16, math.floor(orig_w * (dh / orig_h) + 0.5))
+
+local base_buf   = "cache:ds_cam_base"
+local ae_buf     = "cache:ds_cam_ae"
+local halo_a     = "cache:ds_cam_halo_a"
+local halo_b     = "cache:ds_cam_halo_b"
+local veil_a     = "cache:ds_cam_veil_a"
+local veil_b     = "cache:ds_cam_veil_b"
+local sensor_buf = "cache:ds_cam_sens"
+
+-- Pass 1: ダウンスケール ＋ 倍率色収差 ＋ 周辺ソフト化 ＋ パープルフリンジ ＋ 周辺減光
+obj.clearbuffer(base_buf, dw, dh)
+obj.pixelshader(
+    "ds_optics_base",
+    base_buf,
+    { "object" },
+    {
+        dw, dh,
+        p.softness / 100.0,
+        p.ca_amt / 100.0,
+        p.pf_amt / 100.0,
+        p.vignette / 100.0
+    },
+    "copy",
+    "clamp"
+)
+
+-- Pass 2: 疑似AE用 256点測光（4x4バッファ）
+local ae_tex = base_buf
+if p.ae_str > 0 then
+    obj.clearbuffer(ae_buf, 4, 4)
+    obj.pixelshader(
+        "ds_ae_measure",
+        ae_buf,
+        { base_buf },
+        nil,
+        "copy",
+        "clamp"
+    )
+    ae_tex = ae_buf
+end
+
+-- Pass 3: 2パス分離ガウスによるハレーション ＆ 広域ベールフレア生成
+local halo_tex = base_buf
+local veil_tex = base_buf
+if p.halation > 0 or p.veil_flare > 0 then
+    local hw = math.max(16, math.floor(dw * 0.5 + 0.5))
+    local hh = math.max(16, math.floor(dh * 0.5 + 0.5))
+
+    obj.clearbuffer(halo_a, hw, hh)
+    obj.pixelshader("ds_bright_extract", halo_a, { base_buf }, { dw, dh }, "copy", "clamp")
+
+    obj.clearbuffer(halo_b, hw, hh)
+    obj.pixelshader("ds_gauss", halo_b, { halo_a }, { 1.0 / hw, 0.0 }, "copy", "clamp")
+    obj.pixelshader("ds_gauss", halo_a, { halo_b }, { 0.0, 1.0 / hh }, "copy", "clamp")
+    halo_tex = halo_a
+
+    if p.veil_flare > 0 then
+        local vw = math.max(12, math.floor(dw * 0.125 + 0.5))
+        local vh = math.max(12, math.floor(dh * 0.125 + 0.5))
+        obj.clearbuffer(veil_b, vw, vh)
+        obj.pixelshader("ds_gauss", veil_b, { halo_a }, { 1.25 / vw, 0.0 }, "copy", "clamp")
+        obj.clearbuffer(veil_a, vw, vh)
+        obj.pixelshader("ds_gauss", veil_a, { veil_b }, { 0.0, 1.25 / vh }, "copy", "clamp")
+        veil_tex = veil_a
+    end
+end
+
+-- Pass 4: 光源合成 ＋ 疑似AE ＋ 露出補正 ＋ AWB ＋ 3層暗所CMOSノイズ ＋ 階調潰れ
+local noise_seed = (noise_fps > 0) and math.floor(obj.time * noise_fps + 1e-6) or obj.frame
+obj.clearbuffer(sensor_buf, dw, dh)
+obj.pixelshader(
+    "ds_sensor",
+    sensor_buf,
+    { base_buf, ae_tex, halo_tex, veil_tex },
+    {
+        dw, dh,
+        p.halation / 100.0,
+        p.veil_flare / 100.0,
+        p.ae_str / 100.0,
+        eff_ae_exp / 100.0,
+        p.sharpness / 100.0,
+        p.black_lift / 100.0,
+        p.clip_gain / 100.0,
+        p.noise_amt / 100.0,
+        p.chroma_noise / 100.0,
+        p.lowfreq_noise / 100.0,
+        p.fpn_amt / 100.0,
+        p.bit_crush / 100.0,
+        p.awb_mode,
+        p.awb_str / 100.0,
+        noise_seed
+    },
+    "copy",
+    "clamp"
+)
+
+-- Pass 5: YCbCr 4:2:0 サブサンプリング ＋ 8x8 DCT JPEG圧縮
+obj.clearbuffer("tempbuffer", dw, dh)
+if p.jpeg_mix > 0 then
+    local gx = math.ceil(dw / 8)
+    local gy = math.ceil(dh / 8)
+    obj.computeshader(
+        "ds_jpeg",
+        { "tempbuffer" },
+        { sensor_buf },
+        { dw, dh, p.jpeg_q, p.jpeg_mix / 100.0 },
+        gx, gy, 1
+    )
+else
+    obj.copybuffer("tempbuffer", sensor_buf)
+end
+
+-- Pass 6: 元サイズへアップスケール
+local up_sampler = (pixel_upscale == 1) and "dot" or "clamp"
+obj.pixelshader(
+    "ds_upscale",
+    "object",
+    { "tempbuffer" },
+    nil,
+    "copy",
+    up_sampler
+)
